@@ -3054,20 +3054,12 @@ _kbusDestroyMemdescBar1Cb
 #define NV_BUS_MAPPING_TYPE_INTERNAL_FLAGS_SWIZZ_ID 63:32
 
 // Flags affecting mapping reuse
-// METHOD3 (align1): PAGE_SIZE_2M moved here from NOT_AFFECTING — the page-size
-// request must survive into pType->mappingFlags so _kbusInternalBar1Map's
-// converter sees it; it also genuinely keys mapping reuse. Required so the
-// dyn-BAR1 window VA allocation honors a 2MB vaAlign (see nv_gpu_ops.c):
-// GSP binds the window at 2MB granularity, so a 2MB-aligned BAR1 VA makes the
-// binding exact (empirical law S = 2MB*floor((range0+comp)/2MB) - range0,
-// 8/8 measurements, byte-exact bucket edges; S = 0 iff range0 is 2MB-aligned).
 #define BUS_FLAGS_AFFECTING_MAPPING_MASK \
     (BUS_MAP_FB_FLAGS_MAP_RSVD_BAR1     |\
     BUS_MAP_FB_FLAGS_DISABLE_ENCRYPTION |\
     BUS_MAP_FB_FLAGS_MAP_DOWNWARDS      |\
     BUS_MAP_FB_FLAGS_READ_ONLY          |\
-    BUS_MAP_FB_FLAGS_WRITE_ONLY         |\
-    BUS_MAP_FB_FLAGS_PAGE_SIZE_2M)
+    BUS_MAP_FB_FLAGS_WRITE_ONLY)
 
 //
 // Flags not affecting mapping reuse. Fixed offsets aren't tracked by the reuse structure
@@ -3080,6 +3072,7 @@ _kbusDestroyMemdescBar1Cb
     BUS_MAP_FB_FLAGS_ALLOW_DISCONTIG        |\
     BUS_MAP_FB_FLAGS_PAGE_SIZE_4K           |\
     BUS_MAP_FB_FLAGS_PAGE_SIZE_64K          |\
+    BUS_MAP_FB_FLAGS_PAGE_SIZE_2M           |\
     BUS_MAP_FB_FLAGS_PAGE_SIZE_512M         |\
     BUS_MAP_FB_FLAGS_UNMANAGED_MEM_AREA)
 

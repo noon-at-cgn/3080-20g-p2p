@@ -26,6 +26,20 @@
 #include "os-interface.h"
 #include "nv-linux.h"
 #include <linux/hugetlb.h>
+#include <linux/moduleparam.h>
+
+//
+// 3080-20g: aikitoria's hugetlb pin fast path (one pin per hugetlb page, page
+// arrays at hugepage granularity) changes how host memory registered by
+// cudaHostRegister() and similar is pinned and DMA-mapped. It is the only
+// producer of page arrays with a compound order > 0, so with it off every
+// later hugepage branch (nv-dma.c, nv-mmap.c, osmemdesc.c, os.c, mem_desc.c,
+// GMMU map walk) sees order 0 and takes the stock path. Off by default.
+//
+static int nv_hugetlb_pin_fast_path = 0;
+module_param(nv_hugetlb_pin_fast_path, int, 0444);
+MODULE_PARM_DESC(nv_hugetlb_pin_fast_path,
+                 "Experimental: pin hugetlb-backed user memory one hugepage at a time (default 0 = stock path)");
 
 #if defined(NVCPU_FAMILY_X86) && defined(NV_FOLL_LONGTERM_PRESENT) && \
     (defined(NV_PIN_USER_PAGES_HAS_ARGS_VMAS) ||                      \
@@ -266,6 +280,9 @@ static NvBool nv_hugetlb_fast_path_eligible(
     NvU64 range_size;
     unsigned long end;
     unsigned long hpage_size;
+
+    if (!nv_hugetlb_pin_fast_path)
+        return NV_FALSE;
 
     if (!vma || start < vma->vm_start ||
         !is_vm_hugetlb_page(vma) || page_count == 0)

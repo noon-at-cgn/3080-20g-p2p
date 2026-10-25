@@ -97,6 +97,59 @@ areAllGpusP2PCompatible(NvU32 gpuMask)
     return NV_TRUE;
 }
 
+/**
+ * @brief Determines if every GPU can use the PCIe mailbox transport
+ *
+ * The test is pcieP2PType != BAR1 on every GPU: only then does RM reserve
+ * the write mailbox area in BAR1.
+ *
+ * 3080-20g: with pcieP2PType == BAR1 (the default on GPUs with the dynamic
+ * BAR1 route armed, kernel_bif.c) RM allocates no write mailbox in BAR1
+ * (_kbusRequiresP2PMailboxBar1_GM107), so the proprietary PCIe fallback has
+ * no transport and its first mapping fails (kbusSetupMailboxAccess_GM200).
+ * That fallback is reached whenever BAR1 P2P is not qualified, e.g.
+ * RMDynBar1P2PEnable=0, static BAR1 active, BAR1 smaller than FB, or a pair
+ * with one unarmed GPU (kbusIsPcieBar1P2PMappingSupported_GH100). Report no
+ * P2P instead.
+ */
+static NvBool
+areAllGpusMailboxCapable(NvU32 gpuMask)
+{
+    NvU32 gpuInstance = 0;
+    OBJGPU *pGpu;
+
+    while ((pGpu = gpumgrGetNextGpu(gpuMask, &gpuInstance)) != NULL)
+    {
+        KernelBif *pKernelBif = GPU_GET_KERNEL_BIF(pGpu);
+
+        if ((pKernelBif == NULL) ||
+            (pKernelBif->pcieP2PType == NV_REG_STR_RM_PCIEP2P_TYPE_BAR1))
+        {
+            return NV_FALSE;
+        }
+    }
+
+    return NV_TRUE;
+}
+
+// 3080-20g: is the dynamic BAR1 P2P route armed on any GPU in the mask?
+static NvBool
+isAnyGpuDynBar1P2PArmed(NvU32 gpuMask)
+{
+    NvU32 gpuInstance = 0;
+    OBJGPU *pGpu;
+
+    while ((pGpu = gpumgrGetNextGpu(gpuMask, &gpuInstance)) != NULL)
+    {
+        if (dynBar1P2PIsArmed(pGpu))
+        {
+            return NV_TRUE;
+        }
+    }
+
+    return NV_FALSE;
+}
+
 NV_STATUS
 p2pGetCaps
 (
@@ -793,6 +846,29 @@ _kp2pCapsGetStatusOverPcieBar1
         ((pKernelBif->pcieP2PType != NV_REG_STR_RM_PCIEP2P_TYPE_BAR1) &&
          (pKernelBif->pcieP2PType != NV_REG_STR_RM_PCIEP2P_TYPE_AUTO)))
     {
+        //
+        // 3080-20g: with the dynamic BAR1 route armed on a GPU of the pair,
+        // this is a refusal of that route too (e.g. a mixed pair whose GPU0
+        // is not armed); give it the route's refusal line. Log only.
+        //
+        if ((gpumgrGetSubDeviceCount(gpuMask) > 1) && isAnyGpuDynBar1P2PArmed(gpuMask))
+        {
+            NvU32   peerInstance = 0;
+            NvU32   peerInst     = gpuGetInstance(pFirstGpu);
+            OBJGPU *pGpu;
+
+            while ((pGpu = gpumgrGetNextGpu(gpuMask, &peerInstance)) != NULL)
+            {
+                if (pGpu != pFirstGpu)
+                    peerInst = gpuGetInstance(pGpu);
+            }
+
+            dynBar1P2PLogRefusal(pFirstGpu,
+                                 dynBar1P2PIsArmed(pFirstGpu) ?
+                                     "RMForceP2PType or RMPcieP2PType excludes BAR1 P2P" :
+                                     "not GA102 and RMDynBar1P2PEnable=1 not set (dynamic route not armed)",
+                                 gpuGetInstance(pFirstGpu), peerInst);
+        }
         P3_PROBE(P3_TAG_PEERQ,
                  "BAR1 gate1 fail: forceP2PType=0x%x pcieP2PType=0x%x",
                  pKernelBif->forceP2PType, pKernelBif->pcieP2PType);
@@ -991,6 +1067,48 @@ p2pGetCapsStatus
     }
 
     //
+    // 3080-20g: without an armed GPU (kernel_bif.c) this is the stock
+    // 615.71.09 PCIe block, verbatim: BAR1 is only tried when the PCIe walk
+    // allowed read or write, and starts from the walk's status.
+    //
+    if (!isAnyGpuDynBar1P2PArmed(gpuMask))
+    {
+        //
+        // Check PCIE P2P connectivity.
+        //
+        // We can control P2P connectivity for PCI-E peers using regkeys, hence
+        // if either read or write is supported, return success. See
+        // _kp2pCapsCheckStatusOverridesForPcie for details.
+        //
+        if (_kp2pCapsGetStatusOverPcie(gpuMask, pP2PWriteCapStatus,
+                                      pP2PReadCapStatus, &bCommonSwitchFound) == NV_OK)
+        {
+            if ((*pP2PWriteCapStatus == NV0000_P2P_CAPS_STATUS_OK) ||
+                (*pP2PReadCapStatus == NV0000_P2P_CAPS_STATUS_OK))
+            {
+                NvU8 bar1P2PWriteCapStatus = *pP2PWriteCapStatus;
+                NvU8 bar1P2PReadCapStatus = *pP2PReadCapStatus;
+                NvU8 bar1P2PAtomicsCapStatus = NV0000_P2P_CAPS_STATUS_NOT_SUPPORTED;
+
+                *pConnectivity = P2P_CONNECTIVITY_PCIE_PROPRIETARY;
+
+                if (_kp2pCapsGetStatusOverPcieBar1(gpuMask, &bar1P2PWriteCapStatus,
+                        &bar1P2PReadCapStatus, &bar1P2PAtomicsCapStatus, bCommonSwitchFound) == NV_OK)
+                {
+                    *pP2PWriteCapStatus = bar1P2PWriteCapStatus;
+                    *pP2PReadCapStatus = bar1P2PReadCapStatus;
+                    *pP2PAtomicsCapStatus = bar1P2PAtomicsCapStatus;
+                    *pConnectivity = P2P_CONNECTIVITY_PCIE_BAR1;
+                }
+
+                return NV_OK;
+            }
+        }
+
+        return NV_OK;
+    }
+
+    //
     // Check PCIe topology and proprietary P2P capabilities first to retain
     // its common-switch result. BAR1 is a separate transport, so check it
     // with fresh status even when proprietary compatibility failed.
@@ -1021,8 +1139,9 @@ p2pGetCapsStatus
                  bar1P2PWriteCapStatus, bar1P2PReadCapStatus,
                  (NvU32)bCommonSwitchFound);
 
-        // BAR1 is the only architecture-independent PCIe transport here.
-        if (!areAllGpusP2PCompatible(gpuMask))
+        // BAR1 is the only architecture-independent PCIe transport here, and
+        // the mailbox fallback needs a mailbox area on every GPU.
+        if (!areAllGpusP2PCompatible(gpuMask) || !areAllGpusMailboxCapable(gpuMask))
         {
             *pP2PWriteCapStatus = NV0000_P2P_CAPS_STATUS_NOT_SUPPORTED;
             *pP2PReadCapStatus = NV0000_P2P_CAPS_STATUS_NOT_SUPPORTED;

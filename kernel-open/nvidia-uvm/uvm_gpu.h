@@ -766,6 +766,13 @@ struct uvm_gpu_struct
 
     uvm_gpu_semaphore_pool_t *secure_semaphore_pool;
 
+    // 3080-20g BAR1 gate: 2 MiB vidmem sink. Allocated only when this GPU has a
+    // PCIe BAR1 peer without a global BAR1 DMA window (dynamic BAR1 route).
+    // Peer addresses that the gate should have made unreachable are
+    // redirected here instead of to host physical memory.
+    uvm_mem_t *bar1_gate_sink;
+    NvU64 bar1_gate_sink_base;
+
     uvm_channel_manager_t *channel_manager;
 
     uvm_pmm_gpu_t pmm;
@@ -1688,6 +1695,16 @@ uvm_aperture_t uvm_gpu_egm_peer_aperture(uvm_parent_gpu_t *local_gpu, uvm_parent
 bool uvm_parent_gpus_are_nvswitch_connected(const uvm_parent_gpu_t *parent_gpu0, const uvm_parent_gpu_t *parent_gpu1);
 
 bool uvm_parent_gpus_are_bar1_peers(const uvm_parent_gpu_t *parent_gpu0, const uvm_parent_gpu_t *parent_gpu1);
+
+// 3080-20g BAR1 gate: true for a PCIe BAR1 peer pair where RM reports no global
+// BAR1 DMA window in at least one direction (dynamic BAR1 P2P). UVM cannot
+// form peer physical addresses for such a pair, so managed/HMM peer access is
+// not enabled for it; only external (RM-encoded) peer mappings are allowed.
+bool uvm_parent_gpus_bar1_peer_windowless(const uvm_parent_gpu_t *parent_gpu0, const uvm_parent_gpu_t *parent_gpu1);
+
+// Count a VA-space GPU pair that took the BAR1 gate (exported read-only as the
+// uvm_bar1_gate_pairs module parameter).
+void uvm_bar1_gate_note_pair(void);
 
 bool uvm_parent_gpus_are_nvlink_direct_connected(const uvm_parent_gpu_t *parent_gpu0, const uvm_parent_gpu_t *parent_gpu1);
 

@@ -122,13 +122,13 @@ MODULE_LICENSE("Dual MIT/GPL");
 //
 // DBG-INSTRUMENTATION (P3 calibration sweep): runtime-tunable extra delta
 // applied to the dynbar1 window encode base (bytes; may be negative).
-// Sweepable without reloading:
-//   echo 0x190000 > /sys/module/nvidia/parameters/nv_dynbar1_calib
-// Takes effect at the NEXT dynamic-window creation. Debug builds only.
+// The parameter is read-only (0444).
+// 3080-20g: read-only, and any non-zero value makes window creation fail
+// (nv_gpu_ops.c _nvGpuOpsDynBar1Create), so it cannot redirect peer writes.
 //
 unsigned long long nv_dynbar1_calib = 0;
-module_param(nv_dynbar1_calib, ullong, 0644);
-MODULE_PARM_DESC(nv_dynbar1_calib, "dynbar1 window encode extra delta in bytes (debug)");
+module_param(nv_dynbar1_calib, ullong, 0444);
+MODULE_PARM_DESC(nv_dynbar1_calib, "dynbar1 window encode extra delta in bytes (debug; must be 0, windows are refused otherwise)");
 
 //
 // patch3/候选A (2026-09-20): dynbar1 P2P window budget reserve, in MiB.
@@ -156,10 +156,35 @@ MODULE_PARM_DESC(nv_dynbar1_reserve_mb, "dynbar1 P2P budget reserve in MiB, clam
 // floor(w0/2MB) - ceil(range0/2MB) = -1, so mapping the aperture at FB
 // offset delta = 0x190000 (2MB - 0x70000) makes the anchor land EXACTLY on
 // allocFB. Takes effect at the NEXT dynamic-window creation.
+// 3080-20g: read-only; non-zero values are refused as for nv_dynbar1_calib.
 //
 unsigned long long nv_dynbar1_delta = 0;
-module_param(nv_dynbar1_delta, ullong, 0644);
-MODULE_PARM_DESC(nv_dynbar1_delta, "dynbar1 window FB-offset delta in bytes (debug)");
+module_param(nv_dynbar1_delta, ullong, 0444);
+MODULE_PARM_DESC(nv_dynbar1_delta, "dynbar1 window FB-offset delta in bytes (debug; must be 0, windows are refused otherwise)");
+
+//
+// 3080-20g: read-only counter of RM-level BAR1 P2P mappings
+// (NVOS46_FLAGS_P2P, dmaAllocBar1P2PMapping_GH100) refused because the peer
+// has no static BAR1. On the dynamic route peer memory is only mapped
+// through UVM external allocations with checked windows.
+//
+int nv_dynbar1_rm_p2p_refused = 0;
+module_param(nv_dynbar1_rm_p2p_refused, int, 0444);
+MODULE_PARM_DESC(nv_dynbar1_rm_p2p_refused, "Read-only: RM BAR1 P2P mappings refused for peers without static BAR1");
+
+// 3080-20g: rate limit for RM-core log lines of the dynamic BAR1 route (RM
+// core cannot call Linux helpers directly). A private state, not the
+// kernel-wide printk_ratelimit(): other callers of that one (for example
+// kauditd_printk_skb with a steady stream of AppArmor records) can use up its
+// budget for good and silently drop every one of these lines. At most 10
+// lines per 5 s; counters stay exact.
+static DEFINE_RATELIMIT_STATE(nv_dynbar1_log_rs, 5 * HZ, 10);
+
+NvBool nv_dynbar1_log_ratelimit(void);
+NvBool nv_dynbar1_log_ratelimit(void)
+{
+    return __ratelimit(&nv_dynbar1_log_rs) ? NV_TRUE : NV_FALSE;
+}
 
 /*
  * P3 probe framework runtime control (only present with METHOD3_PROBES=1;

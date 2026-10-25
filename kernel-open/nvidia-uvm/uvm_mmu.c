@@ -2410,6 +2410,10 @@ NV_STATUS uvm_mmu_create_peer_identity_mappings(uvm_gpu_t *gpu, uvm_gpu_t *peer)
     if (gpu->parent->peer_copy_mode != UVM_GPU_PEER_COPY_MODE_VIRTUAL || peer->mem_info.size == 0)
         return NV_OK;
 
+    // 3080-20g BAR1 gate: no global BAR1 window, nothing to map (see uvm_gpu.c).
+    if (uvm_parent_gpus_bar1_peer_windowless(gpu->parent, peer->parent))
+        return NV_OK;
+
     // Use transformation of address 0 to get offset and aperture for all
     // other addresses.
     phys_address = uvm_gpu_peer_phys_address(peer, 0, gpu);

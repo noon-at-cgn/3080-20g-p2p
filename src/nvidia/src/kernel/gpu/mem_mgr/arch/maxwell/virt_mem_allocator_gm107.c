@@ -144,6 +144,15 @@
 
 #include "vgpu/rpc.h"
 
+//
+// 3080-20g: true only while _nvGpuOpsDynBar1Create() (nv_gpu_ops.c) maps a
+// dynamic BAR1 P2P window on this GPU. It is set and cleared under that GPU's
+// lock, which every BAR1 mapping change also holds, so the 2 MiB placement
+// floor below applies to peer windows only and every other BAR1 mapping keeps
+// the stock 64 KiB (big page) alignment.
+//
+NvBool g_dynBar1P2PWindowMapActive[NV_MAX_DEVICES];
+
 #define _MMUXLATEVADDR_FLAG_SHOW_INVALID        NVBIT(0)
 #define _MMUXLATEVADDR_FLAG_VALIDATE_ONLY       NVBIT(1) // incomplete
 #define _MMUXLATEVADDR_FLAG_VALIDATE_TERSELY    NVBIT(2) // incomplete
@@ -940,15 +949,20 @@ dmaAllocMapping_GM107
         // granularity and drops the sub-2MB partial first page of the window
         // (empirical law v3: dead = range0 mod 2MB, displacement = delta -
         // residue, 6/6 delta-sweep + 12 comp-sweep points). Raise the VA
-        // ALLOCATION alignment floor to 2MB for >= 2MB mappings so a window
-        // never straddles a 2MB boundary. PTE page size is untouched (still
-        // the 64K VAS big page) — only the placement alignment changes.
+        // ALLOCATION alignment floor to 2MB so a window never straddles a 2MB
+        // boundary. PTE page size is untouched (still the 64K VAS big page) —
+        // only the placement alignment changes.
+        //
+        // 3080-20g: only for dynamic BAR1 P2P windows (any size, so small
+        // windows are aligned too); all other BAR1 mappings keep stock
+        // alignment and VA size.
         //
         if (pLocals->bIsBar1)
         {
-            vaAlign = NV_MAX(vaAlign,
-                (pLocals->mapLength >= RM_PAGE_SIZE_2M) ? RM_PAGE_SIZE_2M
-                                                        : pLocals->vaspaceBigPageSize);
+            NvU32  gpuInst    = gpuGetInstance(pGpu);
+            NvBool bP2PWindow = (gpuInst < NV_MAX_DEVICES) && g_dynBar1P2PWindowMapActive[gpuInst];
+
+            vaAlign = NV_MAX(vaAlign, bP2PWindow ? RM_PAGE_SIZE_2M : pLocals->vaspaceBigPageSize);
             vaSize  = RM_ALIGN_UP(pLocals->mapLength, vaAlign);
             P3_PROBE(P3_TAG_APERT,
                      "bar1 vaAlign: mapLength=0x%llx pageSize=0x%llx vaAlign=0x%llx vaSize=0x%llx",

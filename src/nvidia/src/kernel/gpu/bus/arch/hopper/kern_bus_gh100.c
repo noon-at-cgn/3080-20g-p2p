@@ -1427,6 +1427,70 @@ kbusUnmapCoherentCpuMapping_GH100
     return;
 }
 
+//
+// 3080-20g: was RMPcieP2PType=BAR1 set explicitly for this GPU? The default
+// pcieP2PType of an armed GPU is BAR1 too (kernel_bif.c), so only the
+// registry tells whether stock would also take its BAR1 path.
+//
+static NvBool
+_kbusPcieP2PTypeIsExplicitBar1(OBJGPU *pGpu)
+{
+    NvU32 data32;
+
+    return (osReadRegistryDword(pGpu, NV_REG_STR_RM_PCIEP2P_TYPE, &data32) == NV_OK) &&
+           (data32 == NV_REG_STR_RM_PCIEP2P_TYPE_BAR1);
+}
+
+//
+// 3080-20g: why one GPU of a pair cannot use the dynamic BAR1 P2P route, or
+// NULL if it can.
+//
+static const char *
+_kbusDynBar1P2PRefusalReason
+(
+    OBJGPU    *pGpu,
+    KernelBus *pKernelBus
+)
+{
+    extern unsigned long long nv_dynbar1_calib;
+    extern unsigned long long nv_dynbar1_delta;
+    MemoryManager *pMemoryManager = GPU_GET_MEMORY_MANAGER(pGpu);
+    NvU32 regVal;
+
+    // Armed on GA102, or anywhere with RMDynBar1P2PEnable=1 (kernel_bif.c).
+    if (!dynBar1P2PIsArmed(pGpu))
+    {
+        return "not GA102 and RMDynBar1P2PEnable=1 not set (dynamic route not armed)";
+    }
+
+    // On by default where armed; any explicit value other than 1 turns it off.
+    if ((osReadRegistryDword(pGpu, NV_REG_STR_RM_DYN_BAR1_P2P_ENABLE, &regVal) == NV_OK) &&
+        (regVal != 1))
+    {
+        return "RMDynBar1P2PEnable is set and not 1 (P2P off)";
+    }
+
+    // The static route (whole FB in BAR1) is not the route this series uses.
+    if (kbusIsStaticBar1Enabled(pGpu, pKernelBus))
+    {
+        return "static BAR1 is active (RMForceStaticBar1=0 not set for this card)";
+    }
+
+    if ((pMemoryManager == NULL) ||
+        (kbusGetPciBarSize(pKernelBus, 1) < (pMemoryManager->Ram.fbAddrSpaceSizeMb << 20)))
+    {
+        return "BAR1 is smaller than VRAM";
+    }
+
+    // _nvGpuOpsDynBar1Create() refuses every window while either is set.
+    if ((nv_dynbar1_calib != 0) || (nv_dynbar1_delta != 0))
+    {
+        return "nv_dynbar1_calib or nv_dynbar1_delta is not 0";
+    }
+
+    return NULL;
+}
+
 /*!
  * @brief check if it can support BAR1 P2P between the specified GPUs
  *        At the point this function is called, the system do not support C2C and
@@ -1488,57 +1552,69 @@ kbusIsPcieBar1P2PMappingSupported_GH100
     }
 
     //
-    // DynBar1P2P (Method 3): static BAR1 on both ends is no longer required.
-    // - Static peer (BAR1 >= FB, whole-FB identity region): initiator PTEs encode
-    //   peerStaticBar1DmaBase + fbOffset. Relies on the per-pair IOMMU mapping
-    //   created by kbusCreateP2PMappingForBar1P2P_HAL, which is per-direction
-    //   guarded: the static end's region is mapped into the peer iovaspace.
-    // - Dynamic peer (BAR1 < FB, e.g. RTX 3080 20G with 256MB BAR1): each peer
-    //   allocation is windowed into the peer BAR1 at map time
-    //   (nv_gpu_ops.c _nvGpuOpsDynBar1Create) and carries its own IOMMU mapping,
-    //   so no static region exists or is needed.
-    //
-    // Each direction routes on the ACCESSED GPU's (owner's) static state, so
-    // static/dynamic mixed pairs are advertised.
-    //
-    // Regkey RMDynBar1P2PEnable=0 disables the dynamic/mixed extension: pairs
-    // with any non-static end are cleanly rejected (NOT_SUPPORTED -> callers
-    // fall back to relay/shm). It deliberately does NOT restore the vanilla
-    // both-static check followed by a PROPRIETARY mailbox fallback -- on hosts
-    // with BAR1<FB GeForce cards the mailbox path is a known-bad state (see
-    // gpu2-p2p hard-reset case record §9.3); keep it unreachable.
+    // 3080-20g: stock path, unchanged. Stock 615.71.09 routes this HAL here
+    // only from GH100 on (pre-GH100 chips get a FALSE stub) and supports BAR1 P2P
+    // for both-static pairs that pass its gate 1 (above), which without our
+    // defaults means PDB_PROP_KBUS_SUPPORT_BAR1_P2P_BY_DEFAULT (stock chip
+    // list) or an explicit RMPcieP2PType=BAR1. Such pairs are never refused.
+    // A pair on which the dynamic route is not armed gets the stock answer.
     //
     {
         NvBool bStatic0 = kbusIsStaticBar1Enabled(pGpu0, pKernelBus0);
         NvBool bStatic1 = kbusIsStaticBar1Enabled(pGpu1, pKernelBus1);
 
-        if (!bStatic0 || !bStatic1)
+        if (IsGH100orBetter(pGpu0) && bStatic0 && bStatic1 &&
+            (pKernelBus0->getProperty(pKernelBus0, PDB_PROP_KBUS_SUPPORT_BAR1_P2P_BY_DEFAULT) ||
+             _kbusPcieP2PTypeIsExplicitBar1(pGpu0)))
         {
-            NvU32 regVal = 0;
-            NvBool bDynBar1P2PEnabled = NV_TRUE;
+            P3_PROBE(P3_TAG_PEERQ, "P2PQ stock static path: GPU%u->GPU%u", gpuInst0, gpuInst1);
+            return NV_TRUE;
+        }
 
-            if (osReadRegistryDword(pGpu0, NV_REG_STR_RM_DYN_BAR1_P2P_ENABLE,
-                                    &regVal) == NV_OK)
-            {
-                bDynBar1P2PEnabled = (regVal != 0);
-            }
+        if (!dynBar1P2PIsArmed(pGpu0) && !dynBar1P2PIsArmed(pGpu1))
+        {
+            // Stock: pre-GH100 stub, or both GPUs need static BAR1.
+            return NV_FALSE;
+        }
+    }
 
-            if (!bDynBar1P2PEnabled)
+    //
+    // DynBar1P2P (Method 3): each peer allocation is windowed into the peer
+    // BAR1 at map time (nv_gpu_ops.c _nvGpuOpsDynBar1Create) and carries its
+    // own IOMMU mapping, so no static whole-FB region is needed.
+    //
+    // 3080-20g: on by default on GA102 pairs. BAR1 P2P is advertised only when
+    // both GPUs meet the preconditions of that route
+    // (_kbusDynBar1P2PRefusalReason): route armed (GA102, or
+    // RMDynBar1P2PEnable=1), RMDynBar1P2PEnable unset or 1, static BAR1 off,
+    // BAR1 at least as large as VRAM, and the window debug knobs at 0.
+    // Otherwise the pair is refused here, so CUDA reports no peer access
+    // instead of a peer access that fails at the first window. This covers
+    // mixed armed/unarmed pairs and GA102 static pairs that stock would not
+    // take. p2p_caps.c keeps the PROPRIETARY mailbox fallback unreachable
+    // while any GPU of the pair has pcieP2PType BAR1 (on hosts with BAR1<FB
+    // GeForce cards it is a known-bad state, gpu2-p2p hard-reset case record
+    // §9.3).
+    //
+    {
+        OBJGPU     *pGpus[2]  = { pGpu0, pGpu1 };
+        KernelBus  *pBuses[2] = { pKernelBus0, pKernelBus1 };
+        NvU32       i;
+
+        for (i = 0; i < 2; i++)
+        {
+            const char *pReason = _kbusDynBar1P2PRefusalReason(pGpus[i], pBuses[i]);
+
+            if (pReason != NULL)
             {
-                NV_PRINTF(LEVEL_WARNING,
-                          "DynBar1P2P: disabled by regkey; BAR1 P2P not advertised "
-                          "for pair GPU%u(static=%u) <-> GPU%u(static=%u)\n",
-                          gpuInst0, (NvU32)bStatic0, gpuInst1, (NvU32)bStatic1);
-                P3_PROBE(P3_TAG_PEERQ,
-                         "P2PQ dynbar1 regkey off: GPU%u static=%d, GPU%u static=%d",
-                         gpuInst0, (NvU32)bStatic0, gpuInst1, (NvU32)bStatic1);
+                dynBar1P2PLogRefusal(pGpus[i], pReason, gpuInst0, gpuInst1);
+                P3_PROBE(P3_TAG_PEERQ, "P2PQ dynbar1 refused: GPU%u: %s",
+                         gpuGetInstance(pGpus[i]), pReason);
                 return NV_FALSE;
             }
         }
 
-        P3_PROBE(P3_TAG_PEERQ,
-                 "P2PQ supported: GPU%u->GPU%u static=%d/%d",
-                 gpuInst0, gpuInst1, (NvU32)bStatic0, (NvU32)bStatic1);
+        P3_PROBE(P3_TAG_PEERQ, "P2PQ supported: GPU%u->GPU%u", gpuInst0, gpuInst1);
     }
 
     return NV_TRUE;

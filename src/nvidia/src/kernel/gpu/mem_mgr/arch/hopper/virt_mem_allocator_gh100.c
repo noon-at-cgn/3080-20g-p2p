@@ -72,6 +72,33 @@ dmaAllocBar1P2PMapping_GH100
     pPeerKernelBus = GPU_GET_KERNEL_BUS(pPeerGpu);
 
     //
+    // 3080-20g: this RM-level route maps the peer memory into the peer BAR1
+    // with kbusMapFbApertureSingle() and hands the BAR1 address to the GPU.
+    // With static BAR1 that is the identity window. Without it (dynamic BAR1
+    // route, RMForceStaticBar1=0) the mapping would be a dynamic BAR1 range
+    // without the 2 MiB placement and the alignment refusal that the UVM
+    // window path (nv_gpu_ops.c _nvGpuOpsDynBar1Create) applies, i.e. the
+    // layout dingiv measured to drop or displace peer writes. Refuse it;
+    // peer memory is then reachable only through UVM external mappings.
+    //
+    if (!kbusIsStaticBar1Enabled(pPeerGpu, pPeerKernelBus))
+    {
+        extern NvS32 nv_dynbar1_rm_p2p_refused;
+        extern NvBool nv_dynbar1_log_ratelimit(void);
+
+        // The counter is exact; the log line is rate-limited.
+        portAtomicIncrementS32(&nv_dynbar1_rm_p2p_refused);
+        if (nv_dynbar1_log_ratelimit())
+        {
+            NV_PRINTF(LEVEL_ERROR,
+                      "METHOD3: RM BAR1 P2P mapping of GPU%u memory for GPU%u refused: "
+                      "peer has no static BAR1 (dynamic route maps peers through UVM only)\n",
+                      gpuGetInstance(pPeerGpu), gpuGetInstance(pGpu));
+        }
+        return NV_ERR_NOT_SUPPORTED;
+    }
+
+    //
     // Step 1:
     // Create sub memory descriptor from the memory source (on target GPU) that need to map.
     //

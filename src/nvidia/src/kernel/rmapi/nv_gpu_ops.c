@@ -1942,7 +1942,12 @@ static NV_STATUS nvGpuOpsRmSubDeviceCreate(struct gpuDevice *device)
 
     rmSubDevice = portMemAllocNonPaged(sizeof(*rmSubDevice));
     if (rmSubDevice == NULL)
-       return NV_ERR_INSUFFICIENT_RESOURCES;
+    {
+        // 3080-20g: release both locks before this error return.
+        portSyncRwLockReleaseWrite(rmDevice->btreeLock);
+        portSyncRwLockReleaseRead(session->devicesLock);
+        return NV_ERR_INSUFFICIENT_RESOURCES;
+    }
 
     portMemSet(rmSubDevice, 0, sizeof(*rmSubDevice));
 
@@ -2435,6 +2440,54 @@ NV_STATUS nvGpuOpsDeviceDestroy(struct gpuDevice *device)
 
     if (rmSubDevice->refCount == 0)
     {
+        //
+        // Release any peer windows left on this subdevice while the duped
+        // memory that backs them is guaranteed to exist. Dups of memory
+        // allocated under a subdevice are children of subDeviceHandle
+        // (dupMemory), so freeing that handle first could free the memdesc a
+        // window still references (3080-20g).
+        //
+        // The drain drops a memdesc reference (RefCount--, a plain decrement).
+        // RM dups of NV01_MEMORY_LOCAL_USER change RefCount under the API lock
+        // in write mode but without GPU locks (no GPUS_LOCK_ON_DUP flag,
+        // sharing.c serverUpdateLockFlagsForCopy). This path held only the
+        // owner GPU lock, so take the API lock around the drain to exclude a
+        // concurrent dup of the same memory. RMAPI_LOCK_FLAGS_READ
+        // is requested, but for RM_LOCK_MODULES_GPU_OPS rmapiLockAcquire()
+        // clears it, because the default apiLockModuleMask covers only the
+        // CLIENT group (system.c, rmapi.c), so the lock is taken exclusively.
+        // The window paths elsewhere already run under the API lock. With no
+        // windows left (always the case with P2P off, and in the normal UVM
+        // order) nothing is taken; refCount is 0, so nobody else can add one.
+        //
+        if ((rmSubDevice->pDynBar1Mutex != NULL) && (rmSubDevice->pDynBar1List != NULL))
+        {
+            extern NvBool nv_dynbar1_log_ratelimit(void);
+            NvBool    bApiLockTaken = NV_FALSE;
+            NV_STATUS apiLockStatus;
+
+            if (!rmapiLockIsOwner())
+            {
+                apiLockStatus = rmapiLockAcquire(RMAPI_LOCK_FLAGS_READ, RM_LOCK_MODULES_GPU_OPS);
+                if (apiLockStatus == NV_OK)
+                {
+                    bApiLockTaken = NV_TRUE;
+                }
+                else if (nv_dynbar1_log_ratelimit())
+                {
+                    // Fallback: drain without the API lock.
+                    NV_PRINTF(LEVEL_ERROR,
+                              "METHOD3: API lock acquire failed (0x%x); draining peer windows without it\n",
+                              apiLockStatus);
+                }
+            }
+
+            _nvGpuOpsDynBar1DestroyAll(rmSubDevice);
+
+            if (bApiLockTaken)
+                rmapiLockRelease();
+        }
+
         gpuDeviceDestroyUsermodeRegion(device);
 
         gpuDeviceRmSubDeviceDeinitNvlink(device);
@@ -2450,10 +2503,9 @@ NV_STATUS nvGpuOpsDeviceDestroy(struct gpuDevice *device)
         NV_ASSERT(rmSubDevice->hP2pObject == 0);
         NV_ASSERT(rmSubDevice->p2pObjectRef == 0);
 
-        // Release any peer windows left on this subdevice.
         if (rmSubDevice->pDynBar1Mutex != NULL)
         {
-            _nvGpuOpsDynBar1DestroyAll(rmSubDevice);
+            NV_ASSERT(rmSubDevice->pDynBar1List == NULL);
             portSyncMutexDestroy(rmSubDevice->pDynBar1Mutex);
         }
 
@@ -3771,6 +3823,27 @@ _nvGpuOpsDynBar1Create(subDeviceDesc *rmSubDevice,
 
     portMemSet(&memArea, 0, sizeof(memArea));
 
+    //
+    // 3080-20g: the two calibration knobs shift the encoded DMA base
+    // (calib) or map a shorter BAR1 range than the IOMMU window and the
+    // encoder assume (delta). Either sends peer writes into neighbouring BAR1
+    // mappings. They are read-only; refuse the window if one was set at
+    // module load.
+    //
+    {
+        extern unsigned long long nv_dynbar1_calib;
+        extern unsigned long long nv_dynbar1_delta;
+
+        if ((nv_dynbar1_calib != 0) || (nv_dynbar1_delta != 0))
+        {
+            NV_PRINTF(LEVEL_ERROR,
+                      "METHOD3: nv_dynbar1_calib=0x%llx nv_dynbar1_delta=0x%llx must be 0; "
+                      "refusing peer window\n",
+                      nv_dynbar1_calib, nv_dynbar1_delta);
+            return NV_ERR_NOT_SUPPORTED;
+        }
+    }
+
     // This source-subdevice budget is only an early rejection heuristic.
     // The BAR1 allocator accounts for all peers, NIC mappings and fragmentation.
     if ((bar1Size <= DYN_BAR1_P2P_RESERVE) ||
@@ -3793,20 +3866,29 @@ _nvGpuOpsDynBar1Create(subDeviceDesc *rmSubDevice,
             rmDeviceGpuLocksAcquire(pRemoteGpu, GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_P2P));
     }
 
-    // align2: legacy 64KB-phase window (NO PAGE_SIZE_2M — the recipe requires
-    // a misaligned range0, see the law v2 comment at nv_dynbar1_delta in
-    // nv.c) mapped at FB offset nv_dynbar1_delta.
+    // Map the whole allocation (nv_dynbar1_delta is refused above unless 0),
+    // with the 2 MiB placement floor scoped to this window; see the window
+    // FB-binding and alignment comments below.
     {
         extern unsigned long long nv_dynbar1_delta;
+        extern NvBool g_dynBar1P2PWindowMapActive[NV_MAX_DEVICES];
+        NvU32 remoteInst = gpuGetInstance(pRemoteGpu);
         NvU64 delta = nv_dynbar1_delta;
         if (delta >= mapSize)
             delta = 0;
+
+        // 3080-20g: scope the 2 MiB BAR1 placement floor to this window
+        // (virt_mem_allocator_gm107.c). The remote GPU lock is held here.
+        if (remoteInst < NV_MAX_DEVICES)
+            g_dynBar1P2PWindowMapActive[remoteInst] = NV_TRUE;
         status = kbusMapFbAperture_HAL(pRemoteGpu, pRemoteKernelBus,
                                        pAllocMemDesc,
                                        mrangeMake(delta, mapSize - delta),
                                        &memArea,
                                        BUS_MAP_FB_FLAGS_MAP_UNICAST,
                                        NULL);
+        if (remoteInst < NV_MAX_DEVICES)
+            g_dynBar1P2PWindowMapActive[remoteInst] = NV_FALSE;
     }
 
     if (!bRemoteLockTaken)
@@ -3831,6 +3913,35 @@ _nvGpuOpsDynBar1Create(subDeviceDesc *rmSubDevice,
                   "(numRanges=%llu) on GPU%u; aborting\n",
                   memArea.numRanges, gpuGetInstance(pRemoteGpu));
         status = NV_ERR_INVALID_STATE;
+        goto fail;
+    }
+
+    //
+    // METHOD3 window FB-binding (align3, 2026-09-17): law v3 (64K PTEs,
+    // 18/18 points incl. full delta sweep): the GSP delivers the window's
+    // first (range0 mod 2MB) bytes of encoded writes to nowhere and lands
+    // the rest displaced by (delta - residue). With the 2MB VA placement
+    // floor (virt_mem_allocator_gm107.c bIsBar1, align3) range0 is always
+    // 2MB-aligned => residue 0 => dead zone 0 and, with comp = 0 and
+    // delta = 0, landing == intent EXACTLY for the whole window.
+    // (The sub-2MB partial first page was the entire corruption story:
+    // 610/615 GSP quantizes the aperture at 2MB but the BAR1 VA allocator
+    // placed windows at 64KB phases. duanyll's 4090s passed on allocator
+    // luck: his placements happened to be 2MB-aligned.)
+    //
+    // 3080-20g: a misaligned window would silently drop or displace peer
+    // writes, so refuse it before it is IOMMU-mapped or handed to UVM. This
+    // happens when the BAR1 allocator reuses an existing, differently aligned
+    // mapping of the same memory (new windows get the 2 MiB floor). The
+    // caller gets an error instead of a corrupting window.
+    //
+    if ((memArea.pRanges[0].start & (RM_PAGE_SIZE_2M - 1)) != 0)
+    {
+        NV_PRINTF(LEVEL_ERROR,
+                  "METHOD3: peer window BAR1 offset 0x%llx is not 2 MiB aligned "
+                  "(GPU%u, size 0x%llx); refusing\n",
+                  memArea.pRanges[0].start, gpuGetInstance(pRemoteGpu), mapSize);
+        status = NV_ERR_INVALID_ADDRESS;
         goto fail;
     }
 
@@ -3867,26 +3978,6 @@ _nvGpuOpsDynBar1Create(subDeviceDesc *rmSubDevice,
     }
     portMemSet(pMap, 0, sizeof(*pMap));
     //
-    // METHOD3 window FB-binding (align3, 2026-09-17): law v3 (64K PTEs,
-    // 18/18 points incl. full delta sweep): the GSP delivers the window's
-    // first (range0 mod 2MB) bytes of encoded writes to nowhere and lands
-    // the rest displaced by (delta - residue). With the 2MB VA placement
-    // floor (virt_mem_allocator_gm107.c bIsBar1, align3) range0 is always
-    // 2MB-aligned => residue 0 => dead zone 0 and, with comp = 0 and
-    // delta = 0, landing == intent EXACTLY for the whole window.
-    // (The sub-2MB partial first page was the entire corruption story:
-    // 610/615 GSP quantizes the aperture at 2MB but the BAR1 VA allocator
-    // placed windows at 64KB phases. duanyll's 4090s passed on allocator
-    // luck: his placements happened to be 2MB-aligned.)
-    //
-    if ((memArea.pRanges[0].start & 0x1FFFFFULL) != 0)
-    {
-        NV_PRINTF(LEVEL_ERROR,
-                  "METHOD3: align3 got MISALIGNED range0 0x%llx — dead zone "
-                  "%llu bytes at window head; placement floor regressed?\n",
-                  memArea.pRanges[0].start, memArea.pRanges[0].start & 0x1FFFFFULL);
-    }
-    //
     // P3 calibration sweep knob (see kernel-open/nvidia/nv.c): extra
     // runtime-tunable delta on top of the formula compensation, so the GSP
     // binding function can be mapped in a single boot.
@@ -3900,6 +3991,14 @@ _nvGpuOpsDynBar1Create(subDeviceDesc *rmSubDevice,
     pMap->mappingGpuInstance = gpuGetInstance(pMappingGpu);
     pMap->pRemoteGpu         = pRemoteGpu;
     pMap->pAllocMemDesc      = pAllocMemDesc;
+    // 3080-20g: hold a descriptor reference for as long as the
+    // window exists, so the BAR1 unmap in _nvGpuOpsDynBar1Destroy() never
+    // touches a freed MEMORY_DESCRIPTOR. This does NOT keep the VRAM
+    // allocated: for PMA-backed vidmem memmgrFree() returns the pages to PMA
+    // regardless of this reference (mem_mgr.c, vidmemPmaFree). The pages stay
+    // allocated because the dup holds the Memory object and every path
+    // destroys the window before the dup is freed.
+    memdescAddRef(pAllocMemDesc);
     pMap->pWindowMemDesc     = pWin;
     pMap->memArea            = memArea;
     pMap->size               = mapSize;
@@ -3939,13 +4038,26 @@ fail:
         memdescDestroy(pWin);
     if (bMapped)
     {
-        NvBool bTaken = (rmDeviceGpuLockIsOwner(gpuGetInstance(pRemoteGpu)) || rmGpuLockIsOwner());
+        NvBool    bTaken = (rmDeviceGpuLockIsOwner(gpuGetInstance(pRemoteGpu)) || rmGpuLockIsOwner());
+        NV_STATUS lockStatus = NV_OK;
+
+        // 3080-20g: never unmap without the lock or release a
+        // lock that was not taken. On failure the BAR1 range is leaked.
         if (!bTaken)
-            (void)rmDeviceGpuLocksAcquire(pRemoteGpu, GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_P2P);
-        kbusUnmapFbAperture_HAL(pRemoteGpu, pRemoteKernelBus, pAllocMemDesc, memArea,
-                                BUS_MAP_FB_FLAGS_MAP_UNICAST);
-        if (!bTaken)
-            rmDeviceGpuLocksRelease(pRemoteGpu, GPUS_LOCK_FLAGS_NONE, NULL);
+            lockStatus = rmDeviceGpuLocksAcquire(pRemoteGpu, GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_P2P);
+        if (lockStatus == NV_OK)
+        {
+            kbusUnmapFbAperture_HAL(pRemoteGpu, pRemoteKernelBus, pAllocMemDesc, memArea,
+                                    BUS_MAP_FB_FLAGS_MAP_UNICAST);
+            if (!bTaken)
+                rmDeviceGpuLocksRelease(pRemoteGpu, GPUS_LOCK_FLAGS_NONE, NULL);
+        }
+        else
+        {
+            NV_PRINTF(LEVEL_ERROR,
+                      "METHOD3: GPU%u lock acquire failed (0x%x); leaking BAR1 range 0x%llx of a failed peer window\n",
+                      gpuGetInstance(pRemoteGpu), lockStatus, memArea.pRanges[0].start);
+        }
     }
     return status;
 }
@@ -3982,6 +4094,7 @@ _nvGpuOpsDynBar1Destroy(subDeviceDesc *rmSubDevice, NvHandle hDupMemory)
     gpuDynBar1P2PMapping *pCur;
     KernelBus *pRemoteKernelBus;
     NvBool bTaken;
+    NV_STATUS lockStatus = NV_OK;
 
     portSyncMutexAcquire(rmSubDevice->pDynBar1Mutex);
     for (pCur = rmSubDevice->pDynBar1List; pCur != NULL; pPrev = pCur, pCur = pCur->pNext)
@@ -4014,9 +4127,29 @@ _nvGpuOpsDynBar1Destroy(subDeviceDesc *rmSubDevice, NvHandle hDupMemory)
     pRemoteKernelBus = GPU_GET_KERNEL_BUS(pMap->pRemoteGpu);
     bTaken = (rmDeviceGpuLockIsOwner(gpuGetInstance(pMap->pRemoteGpu)) || rmGpuLockIsOwner());
     if (!bTaken)
-        (void)rmDeviceGpuLocksAcquire(pMap->pRemoteGpu, GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_P2P);
+        lockStatus = rmDeviceGpuLocksAcquire(pMap->pRemoteGpu, GPUS_LOCK_FLAGS_NONE, RM_LOCK_MODULES_P2P);
+    if (lockStatus != NV_OK)
+    {
+        //
+        // 3080-20g: without the owner GPU lock neither the BAR1
+        // unmap nor the release is allowed, so the BAR1 range is leaked. Its
+        // PTEs keep pointing at VRAM that is returned to PMA when the dup is
+        // freed and can be reused. The peer cannot reach it: UVM cleared the
+        // peer PTEs and the IOMMU mapping is already gone. Only root, through
+        // a raw BAR1 resource mapping, could still access the range. The
+        // descriptor reference is kept (the leaked mapping refers to it).
+        //
+        NV_PRINTF(LEVEL_ERROR,
+                  "METHOD3: GPU%u lock acquire failed (0x%x); leaking BAR1 range of peer window hMem 0x%x\n",
+                  gpuGetInstance(pMap->pRemoteGpu), lockStatus, hDupMemory);
+        portMemFree(pMap);
+        return;
+    }
     kbusUnmapFbAperture_HAL(pMap->pRemoteGpu, pRemoteKernelBus, pMap->pAllocMemDesc,
                             pMap->memArea, BUS_MAP_FB_FLAGS_MAP_UNICAST);
+    // Drop the descriptor reference taken in _nvGpuOpsDynBar1Create(), under
+    // the owner GPU lock.
+    memdescDestroy(pMap->pAllocMemDesc);
     if (!bTaken)
         rmDeviceGpuLocksRelease(pMap->pRemoteGpu, GPUS_LOCK_FLAGS_NONE, NULL);
 
@@ -9919,6 +10052,13 @@ NV_STATUS nvGpuOpsFreeDupedHandle(struct gpuDevice *device,
         return status;
     }
 
+    //
+    // 3080-20g: release the peer window first. It is keyed by
+    // the handle alone, so it needs neither lookup below, and the error paths
+    // of those lookups go straight to the Free at "out:".
+    //
+    _nvGpuOpsDynBar1Destroy(device->rmSubDevice, hPhysHandle);
+
     status = subdeviceGetByHandle(pClient, device->subhandle, &pSubdevice);
     if (status != NV_OK)
         goto out;
@@ -9940,9 +10080,6 @@ NV_STATUS nvGpuOpsFreeDupedHandle(struct gpuDevice *device,
         // TODO: Bug 1811060: Add native support for this use-case in RM API.
         memdescUnmapIommu(pMemory->pMemDesc, pMappingGpu->busInfo.iovaspaceId);
     }
-
-    // Release the peer window before freeing the allocation that backs it.
-    _nvGpuOpsDynBar1Destroy(device->rmSubDevice, hPhysHandle);
 
     _disablePeerAccess(device, memdescGetAddressSpace(pMemory->pMemDesc));
 

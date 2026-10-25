@@ -1293,6 +1293,7 @@ static NV_STATUS enable_peers(uvm_va_space_t *va_space, uvm_gpu_t *gpu0, uvm_gpu
     NV_STATUS status = NV_OK;
     NvU32 pair_index;
     uvm_va_range_t *va_range;
+    bool bar1_gated;
     LIST_HEAD(deferred_free_list);
 
     uvm_assert_rwsem_locked_write(&va_space->lock);
@@ -1308,19 +1309,30 @@ static NV_STATUS enable_peers(uvm_va_space_t *va_space, uvm_gpu_t *gpu0, uvm_gpu
 
     UVM_ASSERT(!test_bit(pair_index, va_space->enabled_peers));
 
-    processor_mask_array_set(va_space->can_access, gpu0->id, gpu1->id);
-    processor_mask_array_set(va_space->can_access, gpu1->id, gpu0->id);
-    processor_mask_array_set(va_space->accessible_from, gpu0->id, gpu1->id);
-    processor_mask_array_set(va_space->accessible_from, gpu1->id, gpu0->id);
+    // 3080-20g BAR1 gate: a PCIe BAR1 peer without a global BAR1 DMA window
+    // (dynamic BAR1 P2P) cannot be addressed by UVM: uvm_gpu_peer_phys_address()
+    // would add a base of 0 and the CEs would write host physical memory.
+    // Keep the pair enabled (enabled_peers below) so external allocations can
+    // still be mapped on the peer with RM-encoded window addresses, but leave
+    // can_access, accessible_from and can_copy_from clear. That is the mask
+    // state of two GPUs without P2P: managed and HMM memory migrate or copy
+    // through system memory, never through the BAR1 peer aperture.
+    bar1_gated = uvm_parent_gpus_bar1_peer_windowless(gpu0->parent, gpu1->parent);
+    if (!bar1_gated) {
+        processor_mask_array_set(va_space->can_access, gpu0->id, gpu1->id);
+        processor_mask_array_set(va_space->can_access, gpu1->id, gpu0->id);
+        processor_mask_array_set(va_space->accessible_from, gpu0->id, gpu1->id);
+        processor_mask_array_set(va_space->accessible_from, gpu1->id, gpu0->id);
 
-    if (gpu0->parent->peer_copy_mode != UVM_GPU_PEER_COPY_MODE_UNSUPPORTED) {
-        UVM_ASSERT_MSG(gpu1->parent->peer_copy_mode == gpu0->parent->peer_copy_mode,
-                       "GPU %s GPU %s\n",
-                       uvm_gpu_name(gpu0),
-                       uvm_gpu_name(gpu1));
+        if (gpu0->parent->peer_copy_mode != UVM_GPU_PEER_COPY_MODE_UNSUPPORTED) {
+            UVM_ASSERT_MSG(gpu1->parent->peer_copy_mode == gpu0->parent->peer_copy_mode,
+                           "GPU %s GPU %s\n",
+                           uvm_gpu_name(gpu0),
+                           uvm_gpu_name(gpu1));
 
-        processor_mask_array_set(va_space->can_copy_from, gpu1->id, gpu0->id);
-        processor_mask_array_set(va_space->can_copy_from, gpu0->id, gpu1->id);
+            processor_mask_array_set(va_space->can_copy_from, gpu1->id, gpu0->id);
+            processor_mask_array_set(va_space->can_copy_from, gpu0->id, gpu1->id);
+        }
     }
 
     // Pre-compute nvlink and native atomic masks for the new peers
@@ -1354,6 +1366,10 @@ static NV_STATUS enable_peers(uvm_va_space_t *va_space, uvm_gpu_t *gpu0, uvm_gpu
         // uvm_va_range_disable_peer adds only external allocations to the list,
         // but uvm_va_range_enable_peer doesn't do anything for them.
         UVM_ASSERT(list_empty(&deferred_free_list));
+    }
+    else if (bar1_gated) {
+        // Count only pairs that were actually enabled.
+        uvm_bar1_gate_note_pair();
     }
 
     return status;

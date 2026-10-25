@@ -1160,11 +1160,17 @@
 
 //
 // Type: DWORD
-// DynBar1P2P (Method 3) kill-switch, default ON. When zero, pairs with any
-// non-static BAR1 end are cleanly rejected at the BAR1 qualification gate
-// (callers fall back to relay/shm). It deliberately does NOT restore the
-// vanilla both-static check with a PROPRIETARY mailbox fallback: on hosts
-// with BAR1<FB GeForce cards the mailbox path is a known-bad state.
+// DynBar1P2P (Method 3) switch. 3080-20g: armed and on by default on GA102;
+// on GA102 any explicit value other than 1 turns it off. On other chips it is
+// off unless set to 1 (which arms it there too). Off, or a GPU of the pair
+// failing a precondition of the route (route not armed, static BAR1 active,
+// BAR1 smaller than VRAM, window debug knobs set;
+// kbusIsPcieBar1P2PMappingSupported_GH100), means the pair is cleanly
+// rejected at the BAR1 qualification gate (callers fall back to relay/shm).
+// Pairs that stock supports (both static BAR1 with the stock chip property or
+// an explicit RMPcieP2PType=BAR1) keep the stock path. It deliberately does
+// NOT restore a PROPRIETARY mailbox fallback on armed GPUs: on hosts with
+// BAR1<FB GeForce cards the mailbox path is a known-bad state.
 //
 #define NV_REG_STR_RM_DYN_BAR1_P2P_ENABLE                   "RMDynBar1P2PEnable"
 

@@ -1853,7 +1853,14 @@ static inline int of_get_named_gpio(const struct device_node *np,
 
 #define NV_EXPORT_SYMBOL(symbol)        EXPORT_SYMBOL_GPL(symbol)
 #define NV_CHECK_EXPORT_SYMBOL(symbol)  NV_IS_EXPORT_SYMBOL_PRESENT_##symbol
-// Async PCI probe requires wait_for_device_probe() as a post-registration barrier
-#define NV_PCI_ASYNC_PROBE_SUPPORTED    NV_IS_EXPORT_SYMBOL_PRESENT_wait_for_device_probe
+// Async PCI probe requires wait_for_device_probe() as a post-registration barrier.
+// 3080-20g: forced off, as in the proprietary build of the same release
+// (where wait_for_device_probe() is unavailable because it is GPL-only), so
+// GPUs probe one at a time in PCI bus order (PROBE_FORCE_SYNCHRONOUS,
+// nv-pci.c). With async probe the order was random per load, and with it the
+// /dev/nvidiaN minors, the NVKMS/DRM device order, the DRM connector names and
+// therefore the card that gets the video=HDMI-A-2:e console
+// (docs/p2p-vesa-line.md §7).
+#define NV_PCI_ASYNC_PROBE_SUPPORTED    0
 
 #endif  /* _NV_LINUX_H_ */

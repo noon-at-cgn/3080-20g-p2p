@@ -46,6 +46,7 @@
 #include "uvm_linux.h"
 #include "uvm_mmu.h"
 #include "uvm_kvmalloc.h"
+#include "uvm_mem.h"
 #if UVM_USE_DMA_IOVA_API()
 #include <linux/dma-mapping.h>
 #endif
@@ -61,6 +62,35 @@ module_param(uvm_peer_copy, charp, S_IRUGO);
 MODULE_PARM_DESC(uvm_peer_copy, "Choose the addressing mode for peer copying, options: "
                                 UVM_PARAM_PEER_COPY_PHYSICAL " [default] or " UVM_PARAM_PEER_COPY_VIRTUAL ". "
                                 "Valid for Ampere+ GPUs.");
+
+// 3080-20g BAR1 gate counters, exported read-only for tests:
+//  uvm_bar1_gate_pairs: VA-space GPU pairs where managed/HMM peer access was
+//                       withheld because the BAR1 peer has no global window.
+//  uvm_bar1_gate_trips: peer physical addresses requested for such a pair
+//                       anyway (must stay 0; each one was redirected to the
+//                       accessing GPU's vidmem sink, never to host memory).
+static atomic64_t g_uvm_bar1_gate_pairs = ATOMIC64_INIT(0);
+static atomic64_t g_uvm_bar1_gate_trips = ATOMIC64_INIT(0);
+
+static int uvm_bar1_gate_counter_get(char *buffer, const struct kernel_param *kp)
+{
+    return scnprintf(buffer, PAGE_SIZE, "%lld\n", (long long)atomic64_read((atomic64_t *)kp->arg));
+}
+
+static int uvm_bar1_gate_counter_set(const char *val, const struct kernel_param *kp)
+{
+    return -EPERM;
+}
+
+static const struct kernel_param_ops uvm_bar1_gate_counter_ops = {
+    .set = uvm_bar1_gate_counter_set,
+    .get = uvm_bar1_gate_counter_get,
+};
+
+module_param_cb(uvm_bar1_gate_pairs, &uvm_bar1_gate_counter_ops, &g_uvm_bar1_gate_pairs, S_IRUGO);
+MODULE_PARM_DESC(uvm_bar1_gate_pairs, "Read-only: GPU pairs whose managed/HMM peer access was gated (BAR1 peer without global window)");
+module_param_cb(uvm_bar1_gate_trips, &uvm_bar1_gate_counter_ops, &g_uvm_bar1_gate_trips, S_IRUGO);
+MODULE_PARM_DESC(uvm_bar1_gate_trips, "Read-only: peer addresses requested on a gated pair (must stay 0)");
 
 static uvm_user_channel_t *get_user_channel(uvm_rb_tree_node_t *node)
 {
@@ -1579,6 +1609,55 @@ static NV_STATUS init_parent_gpu(uvm_parent_gpu_t *parent_gpu,
     return NV_OK;
 }
 
+// 3080-20g BAR1 gate: allocate and zero the 2 MiB vidmem sink used by
+// uvm_gpu_peer_phys_address(). Done once per GPU at init, like the other UVM
+// kernel vidmem (semaphore pools, page tables), and freed in deinit_gpu()
+// after the channels are gone. Zeroed so that a gate trip never reads stale
+// data of another process.
+static NV_STATUS bar1_gate_sink_alloc(uvm_gpu_t *gpu)
+{
+    NV_STATUS status;
+    uvm_push_t push;
+
+    UVM_ASSERT(!gpu->bar1_gate_sink);
+
+    status = uvm_mem_alloc_vidmem(UVM_CHUNK_SIZE_MAX, gpu, &gpu->bar1_gate_sink);
+    if (status != NV_OK)
+        return status;
+
+    // One physically contiguous chunk, so sink + (address % 2 MiB) stays inside it.
+    if (gpu->bar1_gate_sink->chunk_size < UVM_CHUNK_SIZE_MAX) {
+        status = NV_ERR_INVALID_STATE;
+        goto error;
+    }
+
+    gpu->bar1_gate_sink_base = uvm_mem_gpu_physical(gpu->bar1_gate_sink, gpu, 0, UVM_CHUNK_SIZE_MAX).address;
+
+    status = uvm_push_begin(gpu->channel_manager, UVM_CHANNEL_TYPE_MEMOPS, &push, "Zero BAR1 gate sink");
+    if (status != NV_OK)
+        goto error;
+
+    gpu->parent->ce_hal->memset_8(&push,
+                                  uvm_gpu_address_copy(gpu, uvm_mem_gpu_physical(gpu->bar1_gate_sink,
+                                                                                 gpu,
+                                                                                 0,
+                                                                                 UVM_CHUNK_SIZE_MAX)),
+                                  0,
+                                  UVM_CHUNK_SIZE_MAX);
+
+    status = uvm_push_end_and_wait(&push);
+    if (status != NV_OK)
+        goto error;
+
+    return NV_OK;
+
+error:
+    uvm_mem_free(gpu->bar1_gate_sink);
+    gpu->bar1_gate_sink = NULL;
+    gpu->bar1_gate_sink_base = 0;
+    return status;
+}
+
 static NV_STATUS init_gpu(uvm_gpu_t *gpu, const UvmGpuInfo *gpu_info)
 {
     char parent_uuid_buffer[UVM_UUID_STRING_LENGTH];
@@ -1687,6 +1766,12 @@ static NV_STATUS init_gpu(uvm_gpu_t *gpu, const UvmGpuInfo *gpu_info)
     status = uvm_mmu_create_flat_mappings(gpu);
     if (status != NV_OK) {
         UVM_ERR_PRINT("Creating flat mappings failed: %s, GPU %s\n", nvstatusToString(status), uvm_gpu_name(gpu));
+        return status;
+    }
+
+    status = bar1_gate_sink_alloc(gpu);
+    if (status != NV_OK) {
+        UVM_ERR_PRINT("Failed to allocate the BAR1 gate sink: %s, GPU %s\n", nvstatusToString(status), uvm_gpu_name(gpu));
         return status;
     }
 
@@ -1863,6 +1948,9 @@ static void deinit_gpu(uvm_gpu_t *gpu)
     // idle during nvUvmInterfaceUnsetPageDirectory() and that's an unnecessary
     // pain during development.
     deconfigure_address_space(gpu);
+
+    uvm_mem_free(gpu->bar1_gate_sink);
+    gpu->bar1_gate_sink = NULL;
 
     deinit_semaphore_pools(gpu);
 
@@ -2194,6 +2282,26 @@ bool uvm_parent_gpus_are_bar1_peers(const uvm_parent_gpu_t *parent_gpu0, const u
         return parent_gpu_peer_caps(parent_gpu0, parent_gpu1)->link_type == UVM_GPU_LINK_PCIE_BAR1;
 
     return false;
+}
+
+bool uvm_parent_gpus_bar1_peer_windowless(const uvm_parent_gpu_t *parent_gpu0, const uvm_parent_gpu_t *parent_gpu1)
+{
+    uvm_parent_gpu_peer_t *parent_peer_caps;
+
+    if (parent_gpu0 == parent_gpu1)
+        return false;
+
+    parent_peer_caps = parent_gpu_peer_caps(parent_gpu0, parent_gpu1);
+
+    return parent_peer_caps->link_type == UVM_GPU_LINK_PCIE_BAR1 &&
+           (parent_peer_caps->bar1_p2p_dma_size[0] == 0 || parent_peer_caps->bar1_p2p_dma_size[1] == 0);
+}
+
+void uvm_bar1_gate_note_pair(void)
+{
+    if (atomic64_inc_return(&g_uvm_bar1_gate_pairs) == 1)
+        UVM_INFO_PRINT("BAR1 peer without global DMA window: managed/HMM peer access disabled, "
+                       "explicit peer mappings kept (uvm_bar1_gate_pairs counts each VA-space pair)\n");
 }
 
 bool uvm_parent_gpus_are_nvlink_direct_connected(const uvm_parent_gpu_t *parent_gpu0,
@@ -2574,6 +2682,15 @@ static NV_STATUS peers_init(uvm_gpu_t *gpu0, uvm_gpu_t *gpu1, uvm_gpu_peer_t *pe
     status = parent_peers_retain(gpu0->parent, gpu1->parent);
     if (status != NV_OK)
         return status;
+
+    // Fail closed: a windowless BAR1 pair is only set up when both GPUs got
+    // their sink at init (init_gpu); it is never allocated here, so a full
+    // peer GPU cannot block this pair.
+    if (uvm_parent_gpus_bar1_peer_windowless(gpu0->parent, gpu1->parent) &&
+        (!gpu0->bar1_gate_sink || !gpu1->bar1_gate_sink)) {
+        status = NV_ERR_INVALID_STATE;
+        goto cleanup_parent;
+    }
 
     // Establish peer mappings from each GPU to the other.
     status = uvm_mmu_create_peer_identity_mappings(gpu0, gpu1);
@@ -3275,7 +3392,19 @@ uvm_gpu_phys_address_t uvm_gpu_peer_phys_address(uvm_gpu_t *owning_gpu, NvU64 ad
         int peer_index = (uvm_id_cmp(accessing_gpu->id, owning_gpu->id) < 0) ? 0 : 1;
 
         UVM_ASSERT(parent_peer_caps->link_type == UVM_GPU_LINK_PCIE_BAR1);
-        UVM_ASSERT(parent_peer_caps->bar1_p2p_dma_size[peer_index] != 0);
+
+        // 3080-20g BAR1 gate: no global window means no valid peer address.
+        // enable_peers() never sets the masks that lead here for such a pair;
+        // if a path gets here anyway, count it and keep the access on the
+        // accessing GPU's own sink instead of host physical memory.
+        if (parent_peer_caps->bar1_p2p_dma_size[peer_index] == 0) {
+            atomic64_inc(&g_uvm_bar1_gate_trips);
+            UVM_ERR_PRINT_RL("BAR1 gate trip: peer address of %s requested by %s; redirected to sink\n",
+                             uvm_gpu_name(owning_gpu),
+                             uvm_gpu_name(accessing_gpu));
+            return uvm_gpu_phys_address(UVM_APERTURE_VID,
+                                        accessing_gpu->bar1_gate_sink_base + (address & (UVM_CHUNK_SIZE_MAX - 1)));
+        }
 
         address += parent_peer_caps->bar1_p2p_dma_base_address[peer_index];
     }
@@ -3302,6 +3431,10 @@ uvm_gpu_address_t uvm_gpu_peer_copy_address(uvm_gpu_t *owning_gpu, NvU64 address
     // the peer copy mode.
     if (accessing_gpu->parent->peer_copy_mode == UVM_GPU_PEER_COPY_MODE_PHYSICAL || mig_peers_use_phys)
         return uvm_gpu_address_from_phys(uvm_gpu_peer_phys_address(owning_gpu, address, accessing_gpu));
+
+    // 3080-20g BAR1 gate: no identity mapping exists for a windowless BAR1 pair.
+    if (uvm_parent_gpus_bar1_peer_windowless(accessing_gpu->parent, owning_gpu->parent))
+        return uvm_gpu_address_copy(accessing_gpu, uvm_gpu_peer_phys_address(owning_gpu, address, accessing_gpu));
 
     // MIG peers do not create peer GPU mappings so it should never reach here.
     UVM_ASSERT(!uvm_gpus_are_smc_peers(owning_gpu, accessing_gpu));

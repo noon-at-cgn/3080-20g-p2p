@@ -1115,6 +1115,55 @@ kbifClearConfigErrors_IMPL
     }
 }
 
+//
+// 3080-20g: is the dynamic BAR1 P2P route armed on this GPU? It is armed on
+// GA102 (the tested chip: the memory-modded RTX 3080 20GB) and, on any chip,
+// when RMDynBar1P2PEnable=1 is set explicitly. Only armed GPUs get the forced
+// BAR1 P2P defaults below; every other GPU keeps the stock defaults. Whether
+// P2P is actually advertised for a pair is decided per pair in
+// kbusIsPcieBar1P2PMappingSupported_GH100 (RMDynBar1P2PEnable=0 turns it off
+// there, also on GA102).
+//
+NvBool
+dynBar1P2PIsArmed(OBJGPU *pGpu)
+{
+    NvU32 data32;
+
+    if (IsGA102(pGpu))
+    {
+        return NV_TRUE;
+    }
+
+    return (osReadRegistryDword(pGpu, NV_REG_STR_RM_DYN_BAR1_P2P_ENABLE, &data32) == NV_OK) &&
+           (data32 == 1);
+}
+
+//
+// 3080-20g: the one refusal line of the dynamic BAR1 P2P route, for every
+// reason, at LEVEL_ERROR (release builds drop lower levels, nvlog_printf.c)
+// through the route's private rate limit (nv.c). Log only.
+//
+void
+dynBar1P2PLogRefusal
+(
+    OBJGPU     *pGpu,
+    const char *pReason,
+    NvU32       gpuInst0,
+    NvU32       gpuInst1
+)
+{
+    extern NvBool nv_dynbar1_log_ratelimit(void);
+
+    if (nv_dynbar1_log_ratelimit())
+    {
+        NV_PRINTF(LEVEL_ERROR,
+                  "DynBar1P2P: GPU %04x:%02x:%02x: %s; BAR1 P2P not advertised "
+                  "for pair GPU%u <-> GPU%u\n",
+                  gpuGetDomain(pGpu), gpuGetBus(pGpu), gpuGetDevice(pGpu),
+                  pReason, gpuInst0, gpuInst1);
+    }
+}
+
 /*!
  * @brief Regkey Overrides for Bif
  *
@@ -1129,12 +1178,23 @@ _kbifInitRegistryOverrides
 )
 {
     NvU32 data32;
+    NvBool bDynBar1P2PArmed = dynBar1P2PIsArmed(pGpu);
 
-    // Enable BAR1 P2P reads and writes without overriding platform atomic capabilities.
-    pKernelBif->p2pOverride =
-        DRF_DEF(_REG_STR, _CL_FORCE_P2P, _READ, _ENABLE) |
-        DRF_DEF(_REG_STR, _CL_FORCE_P2P, _WRITE, _ENABLE) |
-        DRF_DEF(_REG_STR, _CL_FORCE_P2P, _ATOMICS, _DEFAULT);
+    //
+    // 3080-20g: on GPUs with the dynamic BAR1 P2P route armed, enable BAR1 P2P
+    // reads and writes without overriding platform atomic capabilities. This
+    // skips stock's PCIe topology/chipset and host-system checks
+    // (p2p_caps.c); it was tested on one platform only (X99, Xeon E5 v4, two
+    // CPU root ports, no switch). Other GPUs keep the stock default.
+    //
+    pKernelBif->p2pOverride = BIF_P2P_NOT_OVERRIDEN;
+    if (bDynBar1P2PArmed)
+    {
+        pKernelBif->p2pOverride =
+            DRF_DEF(_REG_STR, _CL_FORCE_P2P, _READ, _ENABLE) |
+            DRF_DEF(_REG_STR, _CL_FORCE_P2P, _WRITE, _ENABLE) |
+            DRF_DEF(_REG_STR, _CL_FORCE_P2P, _ATOMICS, _DEFAULT);
+    }
     if (osReadRegistryDword(pGpu, NV_REG_STR_CL_FORCE_P2P, &data32) == NV_OK)
     {
         pKernelBif->p2pOverride = data32;
@@ -1150,7 +1210,10 @@ _kbifInitRegistryOverrides
         pKernelBif->forceP2PType = data32;
     }
 
-    pKernelBif->pcieP2PType = NV_REG_STR_RM_PCIEP2P_TYPE_BAR1;
+    // 3080-20g: BAR1 P2P (no mailbox) on armed GPUs; stock default otherwise.
+    // An explicit RMPcieP2PType still wins (see _kbusPcieP2PTypeIsExplicitBar1).
+    pKernelBif->pcieP2PType = bDynBar1P2PArmed ? NV_REG_STR_RM_PCIEP2P_TYPE_BAR1 :
+                                                 NV_REG_STR_RM_PCIEP2P_TYPE_DEFAULT;
     if (osReadRegistryDword(pGpu, NV_REG_STR_RM_PCIEP2P_TYPE, &data32) == NV_OK)
     {
         pKernelBif->pcieP2PType = data32;
