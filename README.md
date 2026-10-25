@@ -96,10 +96,12 @@ make modules -j"$(nproc)"
 (cd kernel-open && sha256sum nvidia*.ko > SHA256SUMS)    # the pins the scripts check
 ```
 
-The scripts are in `contrib/3080-20g/`. Set `GPUS` (for example `"0000:01:00.0 0000:02:00.0"`, from
-`lspci -D -d 10de:2206`) and `OUT` (the full path of `kernel-open`) in `contrib/3080-20g/config.sh`. Each script
-takes `--dry-run` (print the plan, change nothing) or `--yes`, and refuses any `.ko` that does not match
-`SHA256SUMS`. Every program using the GPUs must be stopped first (or set `DRAIN_CMD` and `RESTORE_CMD`).
+The scripts are in `contrib/3080-20g/`. In `contrib/3080-20g/config.sh`, set `OUT` (the full path of `kernel-open`)
+and `GPUS`: the card addresses from `lspci -Dnn -d 10de::0300`, separated by spaces inside one pair of quotes, never
+commas, e.g. `GPUS="0000:01:00.0 0000:02:00.0"`. The driver's per-device line uses semicolons instead
+(`pci=<address>;RMForceStaticBar1=0;` per card); 3080-20gb-rebar's `install.sh` writes it. Each script takes
+`--dry-run` (print the plan, change nothing) or `--yes`, and refuses any `.ko` that does not match `SHA256SUMS`.
+Every program using the GPUs must be stopped first (or set `DRAIN_CMD` and `RESTORE_CMD`).
 
 **Load by hand** (nothing installed; a reboot loads what modprobe resolves):
 
