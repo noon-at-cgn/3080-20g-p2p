@@ -20,6 +20,8 @@ patch: it can hang the machine or corrupt memory.
 - Linux kernel 7.0.14 (Proxmox), NVIDIA driver userspace 615.71.09
 
 Other GA102 cards (RTX 3080, 3080 Ti, 3090, GA102 A-series) take the same code path but are untested.
+Tried it on other cards or another platform? Please file a
+[compatibility report](https://github.com/noon-at-cgn/3080-20g-p2p/issues/new?template=compatibility-report.md).
 
 ## Requirements
 
